@@ -1,0 +1,293 @@
+"""Click CLI entry point for the Kalshi backtester.
+
+Commands
+--------
+  kalshi-bt collect   — Pull resolved markets from the Kalshi API and store
+                        them locally in SQLite.  Run this first.
+
+  kalshi-bt backtest  — Score every stored market, simulate trades on those
+                        that meet the threshold, then print the report.
+
+  kalshi-bt report    — Re-run the report on already-scored/traded data
+                        without hitting the API again.
+
+Configuration is read from a .env file (copy .env.example to .env and fill in
+your credentials).  All options can also be overridden on the command line.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import click
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise click.ClickException(
+            f"Missing required config: {name}. "
+            f"Set it in your .env file or as an environment variable."
+        )
+    return value
+
+
+def _build_client(env: str) -> "KalshiClient":  # noqa: F821  (imported below)
+    from .client import KalshiClient
+
+    api_key_id = _require_env("KALSHI_API_KEY_ID")
+
+    key_path_str = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
+    if key_path_str:
+        key_path = Path(key_path_str).expanduser()
+        if not key_path.exists():
+            raise click.ClickException(
+                f"Private key file not found: {key_path}. "
+                f"Check KALSHI_PRIVATE_KEY_PATH in your .env."
+            )
+        private_key: str | Path = key_path
+    else:
+        # Allow embedding the PEM directly in the env var (newlines as \n)
+        pem = os.getenv("KALSHI_PRIVATE_KEY_PEM", "").strip()
+        if not pem:
+            raise click.ClickException(
+                "No private key configured. Set KALSHI_PRIVATE_KEY_PATH "
+                "(path to .pem file) or KALSHI_PRIVATE_KEY_PEM (inline PEM) "
+                "in your .env."
+            )
+        private_key = pem.replace("\\n", "\n")
+
+    return KalshiClient(api_key_id=api_key_id, private_key=private_key, env=env)
+
+
+# ---------------------------------------------------------------------------
+# CLI group
+# ---------------------------------------------------------------------------
+
+
+@click.group()
+def main() -> None:
+    """Kalshi prediction market backtester.
+
+    \b
+    Quick start:
+      1. cp .env.example .env   # fill in your API credentials
+      2. kalshi-bt collect      # download resolved markets
+      3. kalshi-bt backtest     # score, trade, and report
+    """
+
+
+# ---------------------------------------------------------------------------
+# collect
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option(
+    "--db",
+    "db_path",
+    default=lambda: os.getenv("KALSHI_DB_PATH", "kalshi_backtest.db"),
+    show_default=True,
+    help="SQLite database file path.",
+)
+@click.option(
+    "--env",
+    "kalshi_env",
+    default=lambda: os.getenv("KALSHI_ENV", "demo"),
+    type=click.Choice(["demo", "prod"]),
+    show_default=True,
+    help="Kalshi environment to use.",
+)
+@click.option(
+    "--status",
+    "statuses",
+    default="finalized,settled",
+    show_default=True,
+    help="Comma-separated market statuses to collect.",
+)
+@click.option(
+    "--page-size",
+    default=1000,
+    show_default=True,
+    help="Markets per API page (max 1000).",
+)
+def collect(db_path: str, kalshi_env: str, statuses: str, page_size: int) -> None:
+    """Fetch resolved markets from the Kalshi API and store them locally.
+
+    Safe to re-run — existing records are updated (upserted) rather than
+    duplicated.
+    """
+    from .client import KalshiAPIError
+    from .collector import collect_markets
+
+    status_list = tuple(s.strip() for s in statuses.split(",") if s.strip())
+    client = _build_client(kalshi_env)
+
+    click.echo(f"Connecting to Kalshi ({kalshi_env}) ...")
+    try:
+        fetched, stored = collect_markets(
+            client=client,
+            db_path=db_path,
+            statuses=status_list,
+            page_size=page_size,
+            verbose=True,
+        )
+    except KalshiAPIError as exc:
+        raise click.ClickException(str(exc))
+
+    click.echo(
+        f"\nDone. Fetched {fetched} markets, stored/updated {stored} "
+        f"(skipped {fetched - stored} without usable data)."
+    )
+    click.echo(f"Database: {Path(db_path).resolve()}")
+
+
+# ---------------------------------------------------------------------------
+# backtest
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option(
+    "--db",
+    "db_path",
+    default=lambda: os.getenv("KALSHI_DB_PATH", "kalshi_backtest.db"),
+    show_default=True,
+    help="SQLite database file path.",
+)
+@click.option(
+    "--threshold",
+    default=lambda: float(os.getenv("KALSHI_SCORE_THRESHOLD", "0.4")),
+    show_default=True,
+    type=float,
+    help="Minimum opportunity score (0.0–1.0) required to simulate a trade.",
+)
+@click.option(
+    "--strategy",
+    default=lambda: os.getenv("KALSHI_STRATEGY", "underdog"),
+    type=click.Choice(["underdog", "favorite"]),
+    show_default=True,
+    help=(
+        "underdog: buy the cheaper (<50¢) side. "
+        "favorite: buy the market-favourite (>50¢) side."
+    ),
+)
+@click.option(
+    "--stake",
+    "stake_cents",
+    default=lambda: float(os.getenv("KALSHI_STAKE_CENTS", "100")),
+    show_default=True,
+    type=float,
+    help="Simulated stake per trade in cents (100 = $1.00).",
+)
+def backtest(db_path: str, threshold: float, strategy: str, stake_cents: float) -> None:
+    """Score stored markets, simulate trades, and print a performance report.
+
+    Run `kalshi-bt collect` first to populate the database.
+    """
+    from .collector import load_markets
+    from .scorer import score_markets, filter_by_threshold
+    from .trader import simulate_trades
+    from .reporter import print_report
+
+    db = Path(db_path)
+    if not db.exists():
+        raise click.ClickException(
+            f"Database not found: {db.resolve()}\n"
+            "Run `kalshi-bt collect` first to download market data."
+        )
+
+    click.echo(f"Loading markets from {db.resolve()} ...")
+    markets = load_markets(db_path)
+    if not markets:
+        raise click.ClickException(
+            "No markets in the database. Run `kalshi-bt collect` first."
+        )
+
+    click.echo(f"  Loaded {len(markets)} markets.")
+
+    click.echo("Scoring markets ...")
+    scored = score_markets(markets)
+    qualifying = filter_by_threshold(scored, threshold)
+    click.echo(
+        f"  {len(qualifying)} markets meet the score threshold of {threshold:.2f} "
+        f"(out of {len(scored)} total)."
+    )
+
+    click.echo("Simulating trades ...")
+    trades = simulate_trades(
+        qualifying,
+        score_threshold=threshold,
+        strategy=strategy,
+        stake_cents=stake_cents,
+    )
+    click.echo(f"  {len(trades)} trades simulated.")
+
+    print_report(trades, threshold, strategy, stake_cents)
+
+
+# ---------------------------------------------------------------------------
+# score (inspect scores without running trades)
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option(
+    "--db",
+    "db_path",
+    default=lambda: os.getenv("KALSHI_DB_PATH", "kalshi_backtest.db"),
+    show_default=True,
+    help="SQLite database file path.",
+)
+@click.option(
+    "--top",
+    default=20,
+    show_default=True,
+    help="Number of top-scored markets to display.",
+)
+def score(db_path: str, top: int) -> None:
+    """Show the highest-scoring markets in the database without simulating trades."""
+    from tabulate import tabulate
+    from .collector import load_markets
+    from .scorer import score_markets
+
+    db = Path(db_path)
+    if not db.exists():
+        raise click.ClickException(
+            f"Database not found: {db.resolve()}. Run `kalshi-bt collect` first."
+        )
+
+    markets = load_markets(db_path)
+    scored = sorted(score_markets(markets), key=lambda m: m["score"], reverse=True)
+
+    rows = [
+        [
+            m["ticker"][:35],
+            m.get("category", "")[:14],
+            f"{m['score']:.3f}",
+            f"{m['score_price_deviation']:.3f}",
+            f"{m['score_volume_factor']:.3f}",
+            f"{m['score_time_factor']:.3f}",
+            f"{m['last_price_cents']:.0f}¢",
+            m["result"].upper(),
+        ]
+        for m in scored[:top]
+    ]
+
+    click.echo(f"\nTop {min(top, len(rows))} markets by opportunity score\n")
+    click.echo(tabulate(
+        rows,
+        headers=["Ticker", "Category", "Score", "Price Dev", "Vol", "Time", "Close Price", "Result"],
+        tablefmt="simple",
+    ))
+    click.echo()
