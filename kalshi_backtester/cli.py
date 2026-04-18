@@ -24,6 +24,11 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
+
+def _cents_to_dollars(cents: float) -> str:
+    sign = "-" if cents < 0 else ""
+    return f"{sign}${abs(cents) / 100:.2f}"
+
 load_dotenv()
 
 
@@ -188,12 +193,48 @@ def collect(db_path: str, kalshi_env: str, statuses: str, page_size: int) -> Non
     default=lambda: float(os.getenv("KALSHI_STAKE_CENTS", "100")),
     show_default=True,
     type=float,
-    help="Simulated stake per trade in cents (100 = $1.00).",
+    help="Fixed stake per trade in cents (100 = $1.00).  Ignored when --bankroll is set.",
 )
-def backtest(db_path: str, threshold: float, strategy: str, stake_cents: float) -> None:
+@click.option(
+    "--bankroll",
+    "bankroll_cents",
+    default=lambda: float(os.getenv("KALSHI_BANKROLL_CENTS", "0")),
+    show_default=True,
+    type=float,
+    help=(
+        "Starting bankroll in cents for Kelly position sizing (e.g. 100000 = $1,000). "
+        "When set, overrides --stake and sizes each trade via fractional Kelly."
+    ),
+)
+@click.option(
+    "--kelly-fraction",
+    default=lambda: float(os.getenv("KALSHI_KELLY_FRACTION", "0.25")),
+    show_default=True,
+    type=float,
+    help=(
+        "Fraction of full Kelly to use (0.25 = quarter-Kelly, recommended). "
+        "Only applies when --bankroll is set."
+    ),
+)
+def backtest(
+    db_path: str,
+    threshold: float,
+    strategy: str,
+    stake_cents: float,
+    bankroll_cents: float,
+    kelly_fraction: float,
+) -> None:
     """Score stored markets, simulate trades, and print a performance report.
 
     Run `kalshi-bt collect` first to populate the database.
+
+    \b
+    Position sizing modes:
+      Fixed stake (default): every trade risks --stake cents.
+      Kelly sizing:          pass --bankroll to enable. Sizes each trade in
+                             proportion to the estimated edge using fractional
+                             Kelly. Use --kelly-fraction to control aggression
+                             (0.25 = quarter-Kelly is the safe default).
     """
     from .collector import load_markets
     from .scorer import score_markets, filter_by_threshold
@@ -224,16 +265,25 @@ def backtest(db_path: str, threshold: float, strategy: str, stake_cents: float) 
         f"(out of {len(scored)} total)."
     )
 
-    click.echo("Simulating trades ...")
+    if bankroll_cents > 0:
+        click.echo(
+            f"Simulating trades (Kelly sizing, {kelly_fraction:.2f}× fraction, "
+            f"bankroll={_cents_to_dollars(bankroll_cents)}) ..."
+        )
+    else:
+        click.echo(f"Simulating trades (fixed stake={_cents_to_dollars(stake_cents)}) ...")
+
     trades = simulate_trades(
         qualifying,
         score_threshold=threshold,
         strategy=strategy,
         stake_cents=stake_cents,
+        bankroll_cents=bankroll_cents,
+        kelly_fraction=kelly_fraction,
     )
     click.echo(f"  {len(trades)} trades simulated.")
 
-    print_report(trades, threshold, strategy, stake_cents)
+    print_report(trades, threshold, strategy, stake_cents, bankroll_cents, kelly_fraction)
 
 
 # ---------------------------------------------------------------------------
