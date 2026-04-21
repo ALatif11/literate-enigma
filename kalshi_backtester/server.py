@@ -139,7 +139,7 @@ def _market_to_response(m: dict, kelly_fraction: float = 0.25) -> dict:
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html = (_STATIC / "index.html").read_text()
+    html = (_STATIC / "index.html").read_text(encoding="utf-8")
     return HTMLResponse(html)
 
 
