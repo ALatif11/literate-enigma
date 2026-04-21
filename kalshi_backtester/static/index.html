@@ -132,3 +132,410 @@ body{background:var(--bg);color:var(--text);font-family:var(--font-mono)}
 .nav-btn.active{color:var(--accent)}
 .nav-icon{font-size:18px}
 </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const DEFAULT = { threshold:0.35, strategy:"underdog", kelly_fraction:0.25, bankroll_cents:0, stake_cents:100 };
+const ring = s => s>=0.70?"ring-high":s>=0.50?"ring-med":"ring-low";
+const pct  = v => `${(v*100).toFixed(1)}%`;
+const usd  = c => `${c>=0?"":"-"}$${(Math.abs(c)/100).toFixed(2)}`;
+const kfmt = v => `$${(v/1000).toFixed(0)}k`;
+
+function App() {
+  const [tab, setTab]           = useState("scanner");
+  const [markets, setMarkets]   = useState([]);
+  const [scanLoad, setScanLoad] = useState(false);
+  const [scanErr,  setScanErr]  = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [aiText,   setAiText]   = useState("");
+  const [aiLoad,   setAiLoad]   = useState(false);
+  const [bt,       setBt]       = useState(null);
+  const [btLoad,   setBtLoad]   = useState(false);
+  const [btErr,    setBtErr]    = useState(null);
+  const [status,   setStatus]   = useState(null);
+  const [collecting, setCollecting] = useState(false);
+  const [settings, setSettings] = useState(() => {
+    try { return { ...DEFAULT, ...JSON.parse(localStorage.getItem("kcc") || "{}") }; }
+    catch { return DEFAULT; }
+  });
+  const debounce = useRef(null);
+  const poll     = useRef(null);
+
+  const save = s => { setSettings(s); localStorage.setItem("kcc", JSON.stringify(s)); };
+
+  const fetchStatus = async () => {
+    try { const r = await fetch("/api/status"); setStatus(await r.json()); } catch {}
+  };
+
+  const fetchMarkets = async () => {
+    setScanLoad(true); setScanErr(null);
+    try {
+      const r = await fetch(`/api/scan?kelly_fraction=${settings.kelly_fraction}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || "Failed");
+      setMarkets(d.markets || []);
+    } catch(e) { setScanErr(e.message); }
+    setScanLoad(false);
+  };
+
+  const fetchBt = async (s=settings) => {
+    setBtLoad(true); setBtErr(null);
+    try {
+      const q = new URLSearchParams({ threshold:s.threshold, strategy:s.strategy,
+        bankroll_cents:s.bankroll_cents, kelly_fraction:s.kelly_fraction, stake_cents:s.stake_cents });
+      const r = await fetch(`/api/backtest?${q}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || "No data");
+      setBt(d);
+    } catch(e) { setBtErr(e.message); setBt(null); }
+    setBtLoad(false);
+  };
+
+  const fetchAI = async m => {
+    setAiLoad(true); setAiText("");
+    try {
+      const q = new URLSearchParams({ title:m.title, price:m.last_price_cents,
+        volume:m.volume, hours_left:m.hours_left||0, score:m.score, category:m.category });
+      const r = await fetch(`/api/market/${m.ticker}/ai?${q}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || "AI unavailable");
+      setAiText(d.analysis);
+    } catch(e) { setAiText(`⚠ ${e.message}`); }
+    setAiLoad(false);
+  };
+
+  useEffect(() => {
+    if (tab==="scanner") { fetchMarkets(); fetchStatus(); }
+    if (tab==="backtest") fetchBt();
+    if (tab==="settings") fetchStatus();
+  }, [tab]);
+
+  const handleSettings = s => {
+    save(s);
+    if (tab==="backtest") {
+      clearTimeout(debounce.current);
+      debounce.current = setTimeout(() => fetchBt(s), 500);
+    }
+  };
+
+  const handleSelect = m => { setSelected(m); setTab("decide"); fetchAI(m); };
+
+  const handleCollect = async () => {
+    setCollecting(true);
+    try {
+      await fetch("/api/collect", { method:"POST" });
+      poll.current = setInterval(async () => {
+        const r = await fetch("/api/status"); const d = await r.json(); setStatus(d);
+        if (!d.collecting) { clearInterval(poll.current); setCollecting(false); }
+      }, 3000);
+    } catch { setCollecting(false); }
+  };
+
+  useEffect(() => () => { clearInterval(poll.current); clearTimeout(debounce.current); }, []);
+
+  const rec = (() => {
+    if (!selected) return null;
+    if (selected.score < settings.threshold) return { label:"PASS",    sub:"Score below threshold",       icon:"⏸", cls:"rec-pass", col:"var(--yellow)" };
+    if (selected.last_price_cents < 40)      return { label:"BUY YES", sub:"Underdog appears underpriced", icon:"↑", cls:"rec-yes",  col:"var(--green)"  };
+    if (selected.last_price_cents > 60)      return { label:"BUY NO",  sub:"Favorite appears overpriced",  icon:"↓", cls:"rec-no",   col:"var(--red)"    };
+    return                                          { label:"PASS",    sub:"Price near fair value",         icon:"⏸", cls:"rec-pass", col:"var(--yellow)" };
+  })();
+
+  const chartMax = bt ? Math.max(...(bt.trades||[]).map(t=>Math.abs(t.profit_cents)),1) : 1;
+
+  /* ── Scanner Tab ── */
+  const ScanTab = (
+    <>
+      <div className="header-controls">
+        <div className="section-label">OPPORTUNITIES</div>
+        <button className="refresh-btn" onClick={fetchMarkets} disabled={scanLoad}>
+          <span className={scanLoad?"spinning":""}>⟳</span> SCAN
+        </button>
+      </div>
+      {scanLoad && [1,2,3].map(i=><div key={i} className="skeleton"/>)}
+      {scanErr && (
+        <div className="info-card error">
+          <div className="info-icon">⚠</div>
+          <div className="info-title">Cannot reach Kalshi</div>
+          <div className="info-sub">{scanErr}</div>
+        </div>
+      )}
+      {!scanLoad && !scanErr && markets.length===0 && (
+        <div className="info-card">
+          <div className="info-icon">◎</div>
+          <div className="info-title">No markets found</div>
+          <div className="info-sub">Check API credentials in CONFIG,<br/>or tap SCAN to retry.</div>
+        </div>
+      )}
+      {markets.map((m,i) => (
+        <div key={m.ticker}
+          className={`market-card${selected?.ticker===m.ticker?" selected":""}`}
+          style={{animationDelay:`${i*.04}s`}}
+          onClick={()=>handleSelect(m)}>
+          <div className="card-top">
+            <div className="market-title">{m.title}</div>
+            <div className={`score-ring ${ring(m.score)}`}>{Math.round(m.score*100)}</div>
+          </div>
+          <div className="card-meta">
+            <span className="meta-pill">{m.category}</span>
+            <span className="meta-pill">{m.last_price_cents?.toFixed(0)}¢ YES</span>
+            <span className="meta-pill">{kfmt(m.volume||0)} vol</span>
+            {m.hours_left>0 && <span className="meta-pill">{m.hours_left?.toFixed(0)}h left</span>}
+          </div>
+          <div className="price-bar-bg">
+            <div className="price-fill" style={{
+              width:`${m.last_price_cents}%`,
+              background: m.last_price_cents>50
+                ? "linear-gradient(90deg,#1a3a28,var(--green))"
+                : "linear-gradient(90deg,var(--red),#3a1a1a)"
+            }}/>
+          </div>
+          {m.anomaly && <div className="anomaly-flag">⚡ ANOMALY</div>}
+        </div>
+      ))}
+    </>
+  );
+
+  /* ── Decide Tab ── */
+  const DecideTab = !selected ? (
+    <div className="no-selection">
+      <div className="no-sel-icon">◎</div>
+      <div>Select a market from the Scanner<br/>to get a decision analysis</div>
+    </div>
+  ) : (
+    <>
+      <div className="decision-panel">
+        <div className="panel-title">SELECTED MARKET</div>
+        <div className="market-selected-header">
+          <div className={`score-ring ${ring(selected.score)}`}>{Math.round(selected.score*100)}</div>
+          <div className="market-selected-title">{selected.title}</div>
+        </div>
+        <div className="stats-grid">
+          {[
+            ["YES PRICE",  `${selected.last_price_cents?.toFixed(0)}¢`, selected.last_price_cents>50?"var(--green)":"var(--red)"],
+            ["VOLUME",     kfmt(selected.volume||0),                    "var(--accent3)"],
+            ["HOURS LEFT", `${(selected.hours_left||0).toFixed(0)}h`,   "var(--text)"],
+            ["MODEL PROB", `${((selected.p_model||0)*100).toFixed(0)}%`,"var(--accent3)"],
+          ].map(([l,v,c])=>(
+            <div className="stat-box" key={l}>
+              <div className="stat-label">{l}</div>
+              <div className="stat-value" style={{color:c}}>{v}</div>
+            </div>
+          ))}
+        </div>
+        {rec && (
+          <div className={`recommendation ${rec.cls}`}>
+            <div className="rec-icon">{rec.icon}</div>
+            <div>
+              <div className="rec-label" style={{color:rec.col}}>{rec.label}</div>
+              <div className="rec-sub">{rec.sub}</div>
+            </div>
+          </div>
+        )}
+        <div className="kelly-display">
+          <div className="kelly-label">KELLY FRACTION (MAX {(settings.kelly_fraction*100).toFixed(0)}%)</div>
+          <div className="kelly-row">
+            <div className="kelly-bar-bg">
+              <div className="kelly-bar-fill" style={{width:`${Math.min(100,(selected.kelly_pct||0)/(settings.kelly_fraction*100)*100)}%`}}/>
+            </div>
+            <div className="kelly-pct">{(selected.kelly_pct||0).toFixed(1)}%</div>
+          </div>
+        </div>
+      </div>
+      <div className="breakdown-section">
+        <div className="panel-title">SCORE BREAKDOWN</div>
+        {[
+          ["PRICE DEV", selected.score_price_deviation||0],
+          ["VOLUME",    selected.score_volume_factor||0],
+          ["TIME",      selected.score_time_factor||0],
+        ].map(([l,v])=>(
+          <div className="breakdown-row" key={l}>
+            <div className="breakdown-label">{l}</div>
+            <div className="breakdown-bar-bg"><div className="breakdown-bar-fill" style={{width:`${v*100}%`}}/></div>
+            <div className="breakdown-val">{v.toFixed(2)}</div>
+          </div>
+        ))}
+      </div>
+      <div className="ai-box">
+        <div className="ai-label">◈ AI ANALYSIS</div>
+        {aiLoad
+          ? <div className="ai-loading"><div className="ai-dot"/><div className="ai-dot"/><div className="ai-dot"/></div>
+          : <div className="ai-text">{aiText||"—"}</div>}
+      </div>
+    </>
+  );
+
+  /* ── Backtest Tab ── */
+  const BacktestTab = (
+    <>
+      <div className="section-label">HISTORICAL PERFORMANCE</div>
+      {btLoad && [1,2,3].map(i=><div key={i} className="skeleton" style={{height:60}}/>)}
+      {btErr && (
+        <div className="info-card error">
+          <div className="info-icon">▦</div>
+          <div className="info-title">No backtest data</div>
+          <div className="info-sub">{btErr}<br/>Run <code>kalshi-bt collect</code> or tap COLLECT in CONFIG.</div>
+        </div>
+      )}
+      {!btLoad && bt?.metrics && (
+        <>
+          <div className="perf-grid">
+            {[
+              ["WIN RATE",     pct(bt.metrics.win_rate),                                             bt.metrics.win_rate>=.5?"c-green":"c-red"],
+              ["ROI",          (bt.metrics.roi>=0?"+":"")+pct(bt.metrics.roi),                       bt.metrics.roi>=0?"c-green":"c-red"],
+              ["SHARPE",       bt.metrics.sharpe!=null?bt.metrics.sharpe.toFixed(2):"N/A",           "c-blue"],
+              ["PROF FACTOR",  bt.metrics.profit_factor!=null?bt.metrics.profit_factor.toFixed(2):"∞","c-yellow"],
+              ["MAX DRAWDOWN", pct(bt.metrics.max_drawdown),                                          "c-red"],
+              ["BRIER",        bt.metrics.brier_score.toFixed(4)+(bt.metrics.brier_score<.25?" ✓":" ✗"), bt.metrics.brier_score<.25?"c-green":"c-yellow"],
+            ].map(([l,v,c])=>(
+              <div className="perf-card" key={l}>
+                <div className="perf-label">{l}</div>
+                <div className={`perf-value ${c}`}>{v}</div>
+              </div>
+            ))}
+          </div>
+          {bt.calibration?.length>1 && (
+            <>
+              <div className="section-label">CALIBRATION</div>
+              <table className="cal-table">
+                <thead><tr><th>BUCKET</th><th>N</th><th>p_model</th><th>WIN RATE</th></tr></thead>
+                <tbody>
+                  {bt.calibration.map(r=>(
+                    <tr key={r.bucket}>
+                      <td>{r.bucket}</td>
+                      <td>{r.count}</td>
+                      <td>{(r.avg_p_model*100).toFixed(0)}%</td>
+                      <td style={{color:r.actual_win_rate>=r.avg_p_model?"var(--green)":"var(--red)"}}>
+                        {pct(r.actual_win_rate)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+          <div className="section-label">P&amp;L PER TRADE</div>
+          <div className="mini-chart">
+            {(bt.trades||[]).slice(0,40).map((t,i)=>(
+              <div key={i} className="bar-col" style={{
+                height:`${(Math.abs(t.profit_cents)/chartMax)*100}%`,
+                background:t.won?"var(--green)":"var(--red)",opacity:.85
+              }}/>
+            ))}
+          </div>
+          <div className="section-label">TRADE LOG</div>
+          {(bt.trades||[]).slice(0,20).map((t,i)=>(
+            <div className="trade-row" key={i}>
+              <div>
+                <div style={{fontSize:11,color:"var(--text)"}}>{t.ticker}</div>
+                <div style={{fontSize:10,color:"var(--text-dim)",marginTop:2}}>
+                  {t.score.toFixed(2)} · {t.direction.toUpperCase()} @ {t.entry_price_cents.toFixed(0)}¢
+                </div>
+              </div>
+              <div className={`t-outcome ${t.won?"c-green":"c-red"}`}>
+                {t.profit_cents>=0?"+":""}{usd(t.profit_cents)}
+              </div>
+            </div>
+          ))}
+        </>
+      )}
+    </>
+  );
+
+  /* ── Config Tab ── */
+  const numField = (label, sub, val, onChange, {step=1,min=0,max=99999}={}) => (
+    <div className="setting-row" key={label}>
+      <div><div className="setting-label">{label}</div><div className="setting-sub">{sub}</div></div>
+      <input className="input-field" type="number" step={step} min={min} max={max}
+        value={val} onChange={e=>onChange(parseFloat(e.target.value)||0)}/>
+    </div>
+  );
+
+  const ConfigTab = (
+    <>
+      <div className="section-label">STRATEGY</div>
+      {numField("Score Threshold","Min score to trade (0–1)",settings.threshold,
+        v=>handleSettings({...settings,threshold:v}),{step:0.05,min:0,max:1})}
+      {numField("Fixed Stake ($)","Per-trade stake when bankroll=0",settings.stake_cents/100,
+        v=>handleSettings({...settings,stake_cents:Math.round(v*100)}),{step:1,min:1})}
+      {numField("Bankroll ($)","0 = fixed stake · >0 = Kelly sizing",settings.bankroll_cents/100,
+        v=>handleSettings({...settings,bankroll_cents:Math.round(v*100)}),{step:10,min:0})}
+      {numField("Kelly Fraction","0.25 = quarter-Kelly (recommended)",settings.kelly_fraction,
+        v=>handleSettings({...settings,kelly_fraction:v}),{step:0.05,min:0.05,max:1})}
+      <div className="setting-row">
+        <div>
+          <div className="setting-label">Strategy</div>
+          <div className="setting-sub">{settings.strategy==="underdog"?"Buy the cheaper side (<50¢)":"Buy the favoured side (>50¢)"}</div>
+        </div>
+        <button className={`toggle${settings.strategy==="underdog"?" on":""}`}
+          onClick={()=>handleSettings({...settings,strategy:settings.strategy==="underdog"?"favorite":"underdog"})}/>
+      </div>
+      <div className="section-label" style={{marginTop:20}}>DATA</div>
+      <button className="collect-btn" onClick={handleCollect} disabled={collecting}>
+        {collecting?"⟳ COLLECTING...":"⬇ COLLECT HISTORICAL MARKETS"}
+      </button>
+      {status && (
+        <div className="status-card">
+          {[
+            ["Environment", <span className={`env-badge ${status.env==="prod"?"env-prod":"env-demo"}`}>{(status.env||"demo").toUpperCase()}</span>],
+            ["Kalshi API",  <span className={status.api_configured?"ok":"warn"}>{status.api_configured?"✓ configured":"✗ missing"}</span>],
+            ["Claude AI",   <span className={status.anthropic_configured?"ok":"warn"}>{status.anthropic_configured?"✓ configured":"✗ missing"}</span>],
+            ["Markets stored", <span style={{color:"var(--text)"}}>{(status.market_count||0).toLocaleString()}</span>],
+            ["Last collected", <span style={{color:"var(--text)"}}>{status.last_collected?new Date(status.last_collected).toLocaleDateString():"never"}</span>],
+          ].map(([k,v])=>(
+            <div className="status-row" key={k}><span className="status-key">{k}</span>{v}</div>
+          ))}
+        </div>
+      )}
+      <div style={{marginTop:16,padding:12,background:"var(--surface)",borderRadius:8,border:"1px solid var(--border)"}}>
+        <div style={{fontSize:10,color:"var(--text-dim)",letterSpacing:1,marginBottom:6}}>ABOUT</div>
+        <div style={{fontSize:11,color:"var(--text-dim)",lineHeight:1.7}}>
+          KALSHI.AI — prediction market command center.<br/>
+          Kelly sizing · Claude AI · Brier calibration.<br/>
+          <span style={{color:"var(--accent)"}}>Always verify before trading real money.</span>
+        </div>
+      </div>
+    </>
+  );
+
+  /* ── Layout ── */
+  return (
+    <>
+      <div className="app">
+        <div className="noise"/>
+        <div className="header">
+          <div className="header-top">
+            <div className="logo">KALSHI<span>.</span>AI</div>
+            <div className="live-badge"><div className="live-dot"/>LIVE</div>
+          </div>
+          <div className="tabs">
+            {[["scanner","SCAN"],["decide","DECIDE"],["backtest","BACKTEST"],["settings","CONFIG"]].map(([id,l])=>(
+              <button key={id} className={`tab${tab===id?" active":""}`} onClick={()=>setTab(id)}>{l}</button>
+            ))}
+          </div>
+        </div>
+        <div className="content">
+          {tab==="scanner" && ScanTab}
+          {tab==="decide"  && DecideTab}
+          {tab==="backtest"&& BacktestTab}
+          {tab==="settings"&& ConfigTab}
+        </div>
+        <div className="bottom-nav">
+          {[["scanner","◎","SCAN"],["decide","⊕","DECIDE"],["backtest","▦","BACKTEST"],["settings","⚙","CONFIG"]].map(([id,icon,l])=>(
+            <button key={id} className={`nav-btn${tab===id?" active":""}`} onClick={()=>setTab(id)}>
+              <span className="nav-icon">{icon}</span>{l}
+            </button>
+          ))}
+        </div>
+      </div>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

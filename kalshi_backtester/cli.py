@@ -341,3 +341,43 @@ def score(db_path: str, top: int) -> None:
         tablefmt="simple",
     ))
     click.echo()
+
+
+# ---------------------------------------------------------------------------
+# serve — launch the web command center
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind.")
+@click.option("--port", default=8000, show_default=True, type=int, help="Port to listen on.")
+@click.option("--reload", is_flag=True, default=False, help="Auto-reload on code changes (dev mode).")
+def serve(host: str, port: int, reload: bool) -> None:
+    """Launch the web command center (browser UI).
+
+    \b
+    Opens a mobile-friendly dashboard at http://localhost:8000 with:
+      · Live market scanner   — scored open markets from Kalshi
+      · Decision panel        — Kelly sizing, score breakdown, Claude AI analysis
+      · Backtest view         — Brier score, Sharpe, drawdown, calibration table
+      · Config                — all settings + historical data collection
+
+    Requires server dependencies:  pip install 'kalshi-backtester[server]'
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        raise click.ClickException(
+            "Server dependencies not installed.\n"
+            "Run: pip install 'kalshi-backtester[server]'"
+        )
+
+    click.echo(f"\n  KALSHI.AI Command Center")
+    click.echo(f"  http://{host}:{port}\n")
+    uvicorn.run(
+        "kalshi_backtester.server:app",
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="warning",
+    )
