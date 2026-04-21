@@ -13,7 +13,7 @@ from .client import KalshiClient
 
 # Markets that have been fully settled with all payouts processed.
 # 'finalized' is the terminal status; 'settled' is the step just before it.
-RESOLVED_STATUSES = ("finalized", "settled")
+RESOLVED_STATUSES = ("settled",)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (

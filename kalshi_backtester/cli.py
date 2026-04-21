@@ -116,7 +116,7 @@ def main() -> None:
 @click.option(
     "--status",
     "statuses",
-    default="finalized,settled",
+    default="settled",
     show_default=True,
     help="Comma-separated market statuses to collect.",
 )
